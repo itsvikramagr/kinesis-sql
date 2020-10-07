@@ -20,23 +20,25 @@ package org.apache.spark.sql.kinesis
 import com.amazonaws.services.kinesis.model.{SequenceNumberRange, Shard}
 
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 
-class ShardSyncerSuite extends SparkFunSuite with SharedSQLContext {
+class ShardSyncerSuite extends SparkFunSuite with SharedSparkSession {
 
   val latestShards = Seq(createShard("shard1", "1"))
   val prevShardInfo = Seq(new ShardInfo("shard0", new AfterSequenceNumber("0")))
 
   test("Should error out when failondataloss is true and a shard is deleted") {
     val ex = intercept[ IllegalStateException ] {
-      ShardSyncer.getLatestShardInfo(latestShards, prevShardInfo, new TrimHorizon, true)
+      ShardSyncer.getLatestShardInfo(latestShards, prevShardInfo,
+        InitialKinesisPosition.fromPredefPosition(new TrimHorizon), true)
     }
   }
 
   test("Should error out when failondataloss is false and a shard is deleted") {
     val expectedShardInfo = Seq(new ShardInfo("Shard1", new TrimHorizon))
     val latest: Seq[ShardInfo] = ShardSyncer.getLatestShardInfo(
-      latestShards, prevShardInfo, new TrimHorizon, false)
+      latestShards, prevShardInfo, InitialKinesisPosition.fromPredefPosition(new TrimHorizon),
+      false)
     assert(latest.nonEmpty)
     assert(latest(0).shardId === "Shard1")
     assert(latest(0).iteratorType === new TrimHorizon().iteratorType )

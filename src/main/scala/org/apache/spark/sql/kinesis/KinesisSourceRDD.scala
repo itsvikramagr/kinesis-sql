@@ -121,7 +121,16 @@ private[kinesis] class KinesisSourceRDD(
     val recordPerRequest =
       sourceOptions.getOrElse("executor.maxRecordPerRead".toLowerCase(Locale.ROOT), "10000").toInt
 
+    val enableIdleTimeBetweenReads: Boolean =
+      sourceOptions.getOrElse("executor.addIdleTimeBetweenReads".toLowerCase(Locale.ROOT),
+        "false").toBoolean
+
+    val idleTimeBetweenReads =
+      sourceOptions.getOrElse("executor.idleTimeBetweenReadsInMs".toLowerCase(Locale.ROOT),
+        "1000").toLong
+
     val startTimestamp: Long = System.currentTimeMillis
+    var lastReadTimeMs: Long = 0
     var lastReadSequenceNumber: String = ""
     var numRecordRead: Long = 0
     var hasShardClosed = false
@@ -156,16 +165,16 @@ private[kinesis] class KinesisSourceRDD(
       }
 
       def canFetchMoreRecords(currentTimestamp: Long): Boolean = {
-        if (lastReadSequenceNumber.isEmpty) {
-          // We are not using timestamp as offset. So we have to make sure that
-          //    a) we reach the tip of the stream if we have not able to
-          //    b) we read at-least one records
-          // so that we are never stuck in the loop where we have data near the tip of the stream
-          // but we are not spending enough time to read it
-          true
-        } else {
-          // honour the maxFetchTime provided in the options.
-          currentTimestamp - startTimestamp < maxFetchTimeInMs
+        currentTimestamp - startTimestamp < maxFetchTimeInMs
+      }
+
+      def addDelayInFetchingRecords(currentTimestamp: Long): Unit = {
+        if ( enableIdleTimeBetweenReads && lastReadTimeMs > 0 ) {
+          val delayMs: Long = idleTimeBetweenReads - (currentTimestamp - lastReadTimeMs)
+          if (delayMs > 0) {
+            logInfo(s"Sleeping for ${delayMs}ms")
+            Thread.sleep(delayMs)
+          }
         }
       }
 
@@ -179,12 +188,14 @@ private[kinesis] class KinesisSourceRDD(
               // getShardIterator() should raise exception if its null if failOnDataLoss is true
               // if failOnDataLoss is false, getShardIterator() will be null and we should stop
               // fetching more records
+              addDelayInFetchingRecords(currentTimestamp)
               val records: GetRecordsResult = kinesisReader.getKinesisRecords(
                 _shardIterator, recordPerRequest)
               // de-aggregate records
               val deaggregateRecords = kinesisReader.deaggregateRecords(records.getRecords, null)
               fetchedRecords = deaggregateRecords.asScala.toArray
               _shardIterator = records.getNextShardIterator
+              lastReadTimeMs = System.currentTimeMillis()
               logDebug(s"Milli secs behind is ${records.getMillisBehindLatest.longValue()}")
               if ( _shardIterator == null ) {
                 hasShardClosed = true
@@ -218,7 +229,7 @@ private[kinesis] class KinesisSourceRDD(
       }
       override protected def close(): Unit = synchronized {
         kinesisReader.close()
-       }
+      }
     }
 
     lazy val metadataCommitter: MetadataCommitter[ShardInfo] = {

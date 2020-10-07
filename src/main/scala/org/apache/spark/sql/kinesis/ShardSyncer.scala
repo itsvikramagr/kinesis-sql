@@ -63,12 +63,12 @@ private[kinesis] object ShardSyncer extends Logging {
         shardIdToShardMap.get(parentShardId) match {
           case None =>
             throw new IllegalStateException(s"ShardId $parentShardId is not closed. " +
-              s"This can happen due to a race condition between describeStream and a" +
+              s"This can happen due to a race condition between listShards and a" +
               s" reshard operation")
           case Some(parentShard: Shard) =>
             if (parentShard.getSequenceNumberRange().getEndingSequenceNumber == null) {
               throw new IllegalStateException(s"ShardId $parentShardId is not closed. " +
-                s"This can happen due to a race condition between describeStream and a " +
+                s"This can happen due to a race condition between listShards and a " +
                 s"reshard operation")
             }
         }
@@ -79,7 +79,7 @@ private[kinesis] object ShardSyncer extends Logging {
   private[kinesis] def AddShardInfoForAncestors(
      shardId: String,
      latestShards: Seq[Shard],
-     initialPosition: KinesisPosition,
+     initialPosition: InitialKinesisPosition,
      prevShardsList: mutable.Set[ String ],
      newShardsInfoMap: mutable.HashMap[ String, ShardInfo ],
      memoizationContext: mutable.Map[String, Boolean ]): Unit = {
@@ -111,7 +111,7 @@ private[kinesis] object ShardSyncer extends Logging {
           logDebug("Need to create a shardInfo for shardId " + parentShardId)
           if (newShardsInfoMap.get(parentShardId).isEmpty) {
               newShardsInfoMap.put(parentShardId,
-                new ShardInfo(parentShardId, initialPosition))
+                new ShardInfo(parentShardId, initialPosition.shardPosition(parentShardId)))
             }
           }
       }
@@ -193,7 +193,7 @@ private[kinesis] object ShardSyncer extends Logging {
   def getLatestShardInfo(
       latestShards: Seq[Shard],
       prevShardsInfo: Seq[ShardInfo],
-      initialPosition: KinesisPosition,
+      initialPosition: InitialKinesisPosition,
       failOnDataLoss: Boolean = true): Seq[ShardInfo] = {
 
     if (latestShards.isEmpty) {
@@ -250,7 +250,7 @@ private[kinesis] object ShardSyncer extends Logging {
           AddShardInfoForAncestors(shardId,
             latestShards, initialPosition, prevShardsList, newShardsInfoMap, memoizationContext)
           newShardsInfoMap.put(shardId,
-            new ShardInfo(shardId, initialPosition))
+            new ShardInfo(shardId, initialPosition.shardPosition(shardId)))
         }
     }
     filteredPrevShardsInfo ++ newShardsInfoMap.values.toSeq

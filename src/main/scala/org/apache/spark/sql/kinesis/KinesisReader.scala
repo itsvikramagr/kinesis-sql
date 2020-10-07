@@ -25,12 +25,12 @@ import java.util.concurrent.{Executors, ThreadFactory}
 import com.amazonaws.AbortedException
 import com.amazonaws.services.kinesis.AmazonKinesisClient
 import com.amazonaws.services.kinesis.clientlibrary.types.UserRecord
-import com.amazonaws.services.kinesis.model.{DescribeStreamRequest, GetRecordsRequest, Shard, _}
-
+import com.amazonaws.services.kinesis.model.{GetRecordsRequest, ListShardsRequest, Shard, _}
 import scala.collection.JavaConverters._
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 import scala.util.control.NonFatal
+
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.types._
 import org.apache.spark.util.{ThreadUtils, UninterruptibleThread}
@@ -68,7 +68,11 @@ private[kinesis] case class KinesisReader(
   private val offsetFetchAttemptIntervalMs =
     readerOptions.getOrElse("client.retryIntervalMs".toLowerCase(Locale.ROOT), "1000").toLong
 
-  private val maxSupportedShardsPerStream = 100
+  private val maxRetryIntervalMs: Long = {
+    readerOptions.getOrElse("client.maxRetryIntervalMs".toLowerCase(Locale.ROOT), "10000").toLong
+  }
+
+  private val maxSupportedShardsPerStream = 10000;
 
   private var _amazonClient: AmazonKinesisClient = null
 
@@ -81,8 +85,8 @@ private[kinesis] case class KinesisReader(
   }
 
   def getShards(): Seq[Shard] = {
-    val shards = describeKinesisStream
-    logInfo(s"Describe Kinesis Stream:  ${shards}")
+    val shards = listShards
+    logInfo(s"List shards in Kinesis Stream:  ${shards}")
     shards
   }
 
@@ -166,36 +170,29 @@ private[kinesis] case class KinesisReader(
     records
   }
 
-  private def describeKinesisStream(): Seq[Shard] = {
-    // TODO - We have a limit on DescribeStream API call.
-    // So we should be cautious before making this call
-
-    val describeStreamRequest = new DescribeStreamRequest
-    describeStreamRequest.setStreamName(streamName)
-    describeStreamRequest.setLimit(maxSupportedShardsPerStream)
-
-    val describeStreamResult: DescribeStreamResult = runUninterruptibly {
-      retryOrTimeout[DescribeStreamResult]( s"Describe Streams") {
-          getAmazonClient.describeStream(describeStreamRequest)
-      }
-    }
-
+  private def listShards(): Seq[Shard] = {
+    var nextToken = ""
+    var returnedToken = ""
     val shards = new ArrayList[Shard]()
-    var exclusiveStartShardId : String = null
+    val listShardsRequest = new ListShardsRequest
+    listShardsRequest.setStreamName(streamName)
+    listShardsRequest.setMaxResults(maxSupportedShardsPerStream)
 
     do {
-        describeStreamRequest.setExclusiveStartShardId( exclusiveStartShardId )
-        val describeStreamResult = getAmazonClient.describeStream( describeStreamRequest )
-        shards.addAll( describeStreamResult.getStreamDescription().getShards() )
-        if (describeStreamResult.getStreamDescription().getHasMoreShards() && shards.size() > 0) {
-          exclusiveStartShardId = shards.get(shards.size() - 1).getShardId();
-        } else {
-          exclusiveStartShardId = null
-       }
-    } while ( exclusiveStartShardId != null )
+      val listShardsResult: ListShardsResult = runUninterruptibly {
+        retryOrTimeout[ListShardsResult]( s"List shards") {
+            getAmazonClient.listShards(listShardsRequest)
+        }
+      }
+      shards.addAll(listShardsResult.getShards)
+      returnedToken = listShardsResult.getNextToken()
+      if (returnedToken != null) {
+        nextToken = returnedToken
+        listShardsRequest.setNextToken(nextToken)
+      }
+    } while (!nextToken.isEmpty)
 
-   shards.asScala.toSeq
-
+    shards.asScala.toSeq
   }
 
   /*
@@ -223,14 +220,12 @@ private[kinesis] case class KinesisReader(
     var lastError: Throwable = null
     var waitTimeInterval = offsetFetchAttemptIntervalMs
 
-    def isTimedOut = (System.currentTimeMillis() - startTimeMs) >= offsetFetchAttemptIntervalMs
-
     def isMaxRetryDone = retryCount >= maxOffsetFetchAttempts
 
-    while (result.isEmpty && !isTimedOut && !isMaxRetryDone) {
+    while (result.isEmpty && !isMaxRetryDone) {
       if ( retryCount > 0 ) { // wait only if this is a retry
         Thread.sleep(waitTimeInterval)
-        waitTimeInterval *= 2 // if you have waited, then double wait time for next round
+        waitTimeInterval = scala.math.min(waitTimeInterval * 2, maxRetryIntervalMs)
       }
       try {
         result = Some(body)
@@ -257,14 +252,8 @@ private[kinesis] case class KinesisReader(
       retryCount += 1
     }
     result.getOrElse {
-      if (isTimedOut ) {
-        throw new IllegalStateException(
-          s"Timed out after ${offsetFetchAttemptIntervalMs} ms while " +
-            s"$message, last exception: ", lastError)
-      } else {
-        throw new IllegalStateException(
-          s"Gave up after $retryCount retries while $message, last exception: ", lastError)
-      }
+      throw new IllegalStateException(
+        s"Gave up after $retryCount retries while $message, last exception: ", lastError)
     }
   }
 
